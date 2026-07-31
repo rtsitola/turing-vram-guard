@@ -1,10 +1,17 @@
-# VRAM Guard DLL — PyTorch/ComfyUI Memory Guard (Experimental)
+# VRAM Guard DLL — GPU Memory Diagnostic Tool
 
-Standalone CUDA DLL that scans GPU VRAM at process startup and isolates defective memory regions.
+Standalone CUDA DLL that scans GPU VRAM and identifies defective memory regions.
 
-## Status: ⚠️ EXPERIMENTAL — does NOT protect PyTorch on WDDM
+## Status: Diagnostic tool — does NOT protect PyTorch/ComfyUI
 
-The cudaMalloc chunked guard works for single-allocator scenarios (llama.cpp/LM Studio) but fails for PyTorch because WDDM assigns different VA→PA mappings to different allocation sequences. See [../docs/vmm-postmortem.md](../docs/vmm-postmortem.md) for details.
+The cudaMalloc chunked guard successfully isolates defective pages within a single allocation sequence (e.g., llama.cpp/LM Studio). However, under WDDM, different processes (and even different allocation sequences within the same process) receive different VA→PA mappings. This means a guard installed via `vg_install()` cannot protect PyTorch tensors — PyTorch allocates through a different sequence and may receive the defective physical pages regardless.
+
+**For PyTorch/ComfyUI protection, the only viable paths are:**
+- VMM / cuMemCreate (dead end on WDDM — see [../docs/vmm-postmortem.md](../docs/vmm-postmortem.md))
+- DPR / Dynamic Page Retirement (untested — see [../docs/ecc-analysis.md](../docs/ecc-analysis.md))
+- Run ComfyUI on a different GPU (e.g., 3070 Ti)
+
+**For llama.cpp/LM Studio, use the ggml-cuda.cu patch instead.** See [../ggml-cuda.patch](../ggml-cuda.patch) and the main [README](../README.md).
 
 ## Files
 
