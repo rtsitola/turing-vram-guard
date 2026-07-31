@@ -1,0 +1,236 @@
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 5436c7e..1b76fee 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -45,6 +45,16 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
++// VRAM guard: verify that the guarded bad chunk is still holding defective pages.
++// Returns 0 if guard is intact, 1 if WDDM evicted/replaced the pages.
++// Call periodically (e.g. before inference) on Turing sm_75 GPUs with known VRAM defects.
++GGML_BACKEND_API int ggml_cuda_guard_verify(int device);
++
++// VRAM guard: re-scan and re-guard after eviction. Best-effort recovery.
++// Returns 0 if guard re-established, 1 if recovery failed (restart recommended).
++// Requires enough free VRAM to allocate scan chunks (~8 MB each × ~3000).
++GGML_BACKEND_API int ggml_cuda_guard_rescan(int device);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cda31bb..879b1f5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -202,6 +202,137 @@ static int ggml_cuda_parse_id(char devName[]) {
+ }
+ #endif // defined(GGML_USE_HIP)
+ 
++// VRAM guard: fill kernel for bad chunk detection
++static __global__ void vram_fill_kernel(char * d, size_t n) {
++    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
++    if (i < n) d[i] = (char)((unsigned int)i * 1103515245);
++}
++
++static __global__ void vram_check_kernel(char * d, unsigned int * errs, size_t n) {
++    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
++    if (i < n) {
++        if (d[i] != (char)((unsigned int)i * 1103515245)) atomicAdd(errs, 1);
++    }
++}
++
++// ── Canary: guarded chunk state for WDDM eviction detection ──
++static struct {
++    char * ptr;
++    size_t bytes;
++    int    device;
++} vram_guard[GGML_CUDA_MAX_DEVICES];
++
++// Verify the guard still holds bad pages. Returns 0 if OK, 1 if evicted/compromised.
++// Call periodically (e.g. before inference) to detect WDDM eviction.
++int ggml_cuda_guard_verify(int device_id) {
++    if (device_id < 0 || device_id >= GGML_CUDA_MAX_DEVICES) return 0;
++    if (vram_guard[device_id].ptr == nullptr) return 0; // no guard installed
++
++    cudaSetDevice(device_id);
++    const int threads = 256;
++    const int blocks  = (int)((vram_guard[device_id].bytes + threads - 1) / threads);
++    unsigned int * d_errs;
++    if (cudaMalloc(&d_errs, sizeof(unsigned int)) != cudaSuccess) return 0;
++
++    cudaMemset(d_errs, 0, sizeof(unsigned int));
++    vram_fill_kernel<<<blocks, threads>>>(vram_guard[device_id].ptr, vram_guard[device_id].bytes);
++    cudaDeviceSynchronize();
++    vram_check_kernel<<<blocks, threads>>>(vram_guard[device_id].ptr, d_errs, vram_guard[device_id].bytes);
++    cudaDeviceSynchronize();
++
++    unsigned int errs = 0;
++    cudaMemcpy(&errs, d_errs, sizeof(unsigned int), cudaMemcpyDeviceToHost);
++    cudaFree(d_errs);
++
++    if (errs == 0) {
++        GGML_LOG_ERROR("[VRAM] GUARD EVICTED on device %d — bad pages remapped!\n", device_id);
++        return 1; // guard compromised
++    }
++    return 0; // OK — guard still on bad pages
++}
++
++// Re-scan and re-guard after eviction. Best-effort: may fail if VRAM is full.
++// Returns 0 if guard re-established, 1 if recovery failed (restart required).
++int ggml_cuda_guard_rescan(int device_id) {
++    if (device_id < 0 || device_id >= GGML_CUDA_MAX_DEVICES) return 1;
++
++    cudaSetDevice(device_id);
++    cudaDeviceProp prop;
++    if (cudaGetDeviceProperties(&prop, device_id) != cudaSuccess) return 1;
++    if (prop.major != 7 || prop.minor != 5) return 0; // not Turing — nothing to do
++
++    // Free the old (evicted) guard
++    if (vram_guard[device_id].ptr != nullptr) {
++        cudaFree(vram_guard[device_id].ptr);
++        vram_guard[device_id].ptr = nullptr;
++    }
++
++    const int chunk_mb = 8;
++    const int neighbor_chunks = 1;
++    const size_t cb = chunk_mb * 1024ULL * 1024ULL;
++    const int max_c = (int)(prop.totalGlobalMem / cb) - 2;
++    const int threads = 256;
++    const int blocks  = (int)((cb + threads - 1) / threads);
++
++    // Try to allocate chunks — may fail if model weights occupy most VRAM
++    char **chunks = (char**)malloc(max_c * sizeof(char*));
++    unsigned int * d_errs = nullptr;
++    if (cudaMalloc(&d_errs, sizeof(unsigned int)) != cudaSuccess) {
++        free(chunks);
++        return 1;
++    }
++
++    int n = 0;
++    for (int i = 0; i < max_c; i++) {
++        if (cudaMalloc(&chunks[i], cb) != cudaSuccess) break;
++        n++;
++    }
++
++    if (n == 0) {
++        GGML_LOG_ERROR("[VRAM] Guard rescan: cannot allocate any chunks (VRAM full)\n");
++        cudaFree(d_errs);
++        free(chunks);
++        memset(&vram_guard[device_id], 0, sizeof(vram_guard[0]));
++        return 1;
++    }
++
++    int bad_chunk = -1;
++    for (int i = 0; i < n && bad_chunk < 0; i++) {
++        cudaMemset(d_errs, 0, sizeof(unsigned int));
++        vram_fill_kernel<<<blocks, threads>>>(chunks[i], cb);
++        cudaDeviceSynchronize();
++        vram_check_kernel<<<blocks, threads>>>(chunks[i], d_errs, cb);
++        cudaDeviceSynchronize();
++        unsigned int errs;
++        cudaMemcpy(&errs, d_errs, sizeof(unsigned int), cudaMemcpyDeviceToHost);
++        if (errs > 0) bad_chunk = i;
++    }
++    cudaFree(d_errs);
++
++    if (bad_chunk >= 0) {
++        int keep_start = (bad_chunk > neighbor_chunks) ? bad_chunk - neighbor_chunks : 0;
++        int keep_end   = (bad_chunk + neighbor_chunks < n) ? bad_chunk + neighbor_chunks : n - 1;
++        for (int i = 0; i < n; i++) {
++            if (i < keep_start || i > keep_end) cudaFree(chunks[i]);
++        }
++        vram_guard[device_id].ptr    = chunks[bad_chunk];
++        vram_guard[device_id].bytes  = cb;
++        vram_guard[device_id].device = device_id;
++        int kept = keep_end - keep_start + 1;
++        GGML_LOG_INFO("[VRAM] Guard rescanned: chunk %d BAD, %d MB reserved (chunks %d-%d)\n",
++            bad_chunk, kept * chunk_mb, keep_start, keep_end);
++        free(chunks);
++        return 0; // success
++    }
++
++    // No bad chunk found — chip may have fully failed, or all chunks are clean
++    for (int i = 0; i < n; i++) cudaFree(chunks[i]);
++    free(chunks);
++    memset(&vram_guard[device_id], 0, sizeof(vram_guard[0]));
++    GGML_LOG_ERROR("[VRAM] Guard rescan: no bad chunk found — chip may be dead\n");
++    return 1;
++}
++
+ static ggml_cuda_device_info ggml_cuda_init() {
+     ggml_cuda_device_info info = {};
+ 
+@@ -347,6 +478,72 @@ static ggml_cuda_device_info ggml_cuda_init() {
+         }
+     }
+ 
++    // VRAM bad-zone guard for Turing (sm_75)
++    // v2: 8 MB chunks (defect localized to 1.719-1.727 GB), ±1 neighbor = 24 MB guard
++    for (int id = 0; id < info.device_count; ++id) {
++        cudaDeviceProp prop;
++        cudaGetDeviceProperties(&prop, id);
++        if (prop.major == 7 && prop.minor == 5) {
++            const int chunk_mb = 8;
++            const int neighbor_chunks = 1;  // ±1 around bad chunk
++            const size_t cb = chunk_mb * 1024ULL * 1024ULL;
++            const int max_c = (int)(prop.totalGlobalMem / cb) - 2;
++            const int threads = 256;
++            const int blocks = (int)((cb + threads - 1) / threads);
++
++            GGML_LOG_INFO("[VRAM] GPU %d: scanning %d chunks of %d MB...\n", id, max_c, chunk_mb);
++
++            char **chunks = (char**)malloc(max_c * sizeof(char*));
++            unsigned int *d_errs;
++            cudaMalloc(&d_errs, sizeof(unsigned int));
++            int n = 0;
++            for (int i = 0; i < max_c; i++) {
++                if (cudaMalloc(&chunks[i], cb) != cudaSuccess) break;
++                n++;
++            }
++
++            int bad_chunk = -1;
++            for (int i = 0; i < n && bad_chunk < 0; i++) {
++                cudaMemset(d_errs, 0, sizeof(unsigned int));
++                vram_fill_kernel<<<blocks, threads>>>(chunks[i], cb);
++                cudaDeviceSynchronize();
++                vram_check_kernel<<<blocks, threads>>>(chunks[i], d_errs, cb);
++                cudaDeviceSynchronize();
++                unsigned int errs;
++                cudaMemcpy(&errs, d_errs, sizeof(unsigned int), cudaMemcpyDeviceToHost);
++                if (errs > 0) {
++                    bad_chunk = i;
++                    GGML_LOG_INFO("[VRAM] Chunk %d BAD (%u errors, %.3f GB) — reserved\n",
++                        i, errs, (double)(i * chunk_mb) / 1024);
++                }
++            }
++            cudaFree(d_errs);
++
++            if (bad_chunk >= 0) {
++                int keep_start = (bad_chunk > neighbor_chunks) ? bad_chunk - neighbor_chunks : 0;
++                int keep_end   = (bad_chunk + neighbor_chunks < n) ? bad_chunk + neighbor_chunks : n - 1;
++                for (int i = 0; i < n; i++) {
++                    if (i < keep_start || i > keep_end) cudaFree(chunks[i]);
++                }
++                int kept = keep_end - keep_start + 1;
++                GGML_LOG_INFO("[VRAM] Guard: %d MB reserved (chunks %d-%d), %.1f GB clean\n",
++                    kept * chunk_mb, keep_start, keep_end,
++                    (double)((n - kept) * chunk_mb) / 1024);
++
++                // Store for canary — use the actual bad chunk (still has stuck-at-0 fingerprint)
++                if (id < GGML_CUDA_MAX_DEVICES) {
++                    vram_guard[id].ptr    = chunks[bad_chunk];
++                    vram_guard[id].bytes  = cb;
++                    vram_guard[id].device = id;
++                }
++            } else {
++                for (int i = 0; i < n; i++) cudaFree(chunks[i]);
++                GGML_LOG_INFO("[VRAM] All %d chunks clean\n", n);
++            }
++            free(chunks);
++        }
++    }
++
+     return info;
+ }
+ 
