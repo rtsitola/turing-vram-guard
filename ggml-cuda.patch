@@ -166,12 +166,13 @@ index cda31bb..879b1f5 100644
      }
  
 +    // VRAM bad-zone guard for Turing (sm_75)
-+    // v2: 8 MB chunks (defect localized to 1.719-1.727 GB), ±1 neighbor = 24 MB guard
++    // Init mode: 64 MB chunks for reliable detection (guarantees L2 eviction on TU102)
++    // Rescan mode (ggml_cuda_guard_rescan): 8 MB chunks when VRAM is partially full
 +    for (int id = 0; id < info.device_count; ++id) {
 +        cudaDeviceProp prop;
 +        cudaGetDeviceProperties(&prop, id);
 +        if (prop.major == 7 && prop.minor == 5) {
-+            const int chunk_mb = 8;
++            const int chunk_mb = 64;  // proven detection at this granularity
 +            const int neighbor_chunks = 1;  // ±1 around bad chunk
 +            const size_t cb = chunk_mb * 1024ULL * 1024ULL;
 +            const int max_c = (int)(prop.totalGlobalMem / cb) - 2;

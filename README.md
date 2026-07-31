@@ -1,6 +1,6 @@
 # Turing VRAM Guard
 
-**How we debugged 32 CUDA builds, found a dead GDDR6 chip, and saved a Quadro RTX 6000 with an 8 MB software memory guard.**
+**How we debugged 32 CUDA builds, found a dead GDDR6 chip, and saved a Quadro RTX 6000 with a 64 MB software memory guard.**
 
 ![Turing VRAM Guard](assets/turing-vram-guard-banner.png)
 
@@ -32,20 +32,23 @@
 
 ## The Fix
 
-A **22-line patch** in `ggml_cuda_init()` (llama.cpp's CUDA backend):
+A **~200-line patch** in `ggml_cuda_init()` (llama.cpp's CUDA backend):
 
 1. Detects Turing sm_75 GPU at startup
-2. Allocates ~3,000 chunks of 8 MB each
+2. Allocates **~370 chunks of 64 MB each** (init mode, guaranteed L2 eviction)
 3. Tests each chunk with fill→sync→check kernels
-4. Finds the bad chunk and keeps it + 1 neighbor (24 MB total)
+4. Finds the bad chunk and keeps it + 1 neighbor (**128 MB total** reserved)
 5. Frees all clean chunks — CUDA allocator never touches the bad region
+
+Also includes a **rescan mode** (`ggml_cuda_guard_rescan()`) that uses 8 MB chunks
+for recovery when VRAM is partially occupied — reserves 24 MB total in that path.
 
 **Result:** Lexi 8B Q5_K_M works perfectly. Clean output on every inference.
 
 ### Features
 
-- **8 MB scanning granularity** — tightest possible before L2 cache masking (6 MB on TU102)
-- **±1 neighbor guard** — 24 MB total reserved, 23.7 GB usable
+- **64 MB init / 8 MB rescan granularity** — largest safe size for init (10× TU102 L2), 8 MB for recovery when VRAM is full
+- **±1 neighbor guard** — 128 MB init / 24 MB rescan reserved; 23.6 GB usable at init
 - **Boot-drift immune** — rescans at every `ggml_cuda_init()` call
 - **Canary thread** — `ggml_cuda_guard_verify()` detects WDDM eviction
 - **Self-healing** — `ggml_cuda_guard_rescan()` re-scans and re-guards without restart
@@ -83,7 +86,7 @@ cmake --build build_cublas --target ggml-cuda --config Release -j 4
 copy build_cublas\bin\ggml-cuda.dll <LM_STUDIO_BACKEND_PATH>\ggml-cuda.dll
 ```
 
-The guard runs automatically on startup for any Turing sm_75 GPU. Look for `[VRAM] Guard: 24 MB reserved` in logs.
+The guard runs automatically on startup for any Turing sm_75 GPU. Look for `[VRAM] Guard: 128 MB reserved` in logs (64 MB init mode).
 
 ### 4. Canary (optional)
 
