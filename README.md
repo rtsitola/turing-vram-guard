@@ -2,6 +2,8 @@
 
 **How we debugged 32 CUDA builds, found a dead GDDR6 chip, and saved a Quadro RTX 6000 with an 8 MB software memory guard.**
 
+![Turing VRAM Guard](assets/turing-vram-guard-banner.png)
+
 [![NVIDIA Developer Forum](https://img.shields.io/badge/NVIDIA-Dev_Forum-76B900?logo=nvidia)](https://forums.developer.nvidia.com/t/turing-sm_75-fp16-tensor-core-corruption-root-cause-gddr6-defect/376994)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
