@@ -27,6 +27,8 @@
 | 6 | Walking-bit pattern test | **Stuck-at-0** cells confirmed |
 | 7 | Granularity sweep (32→16→8→4 MB) | Defect localizes to **~8 MB at 1.719 GB** |
 | 8 | L2 cache floor identified | 4 MB tests fail — TU102 has **6 MB L2 cache** |
+| 9 | DPR (Dynamic Page Retirement) | **DEAD END on Windows WDDM** — race condition between InfoROM write and CUDA job termination; disable/enable cycles shift defect across chunks |
+| 10 | Software guard deployed | 96 MB reserved in llama.cpp/LM Studio (init), 8 MB in ComfyUI (vramguard.dll) |
 
 **Key lesson:** Check ECC before anything else. `nvidia-smi -q -d ECC` would have saved us 30 of those 32 builds.
 
@@ -35,13 +37,18 @@
 A **~200-line patch** in `ggml_cuda_init()` (llama.cpp's CUDA backend):
 
 1. Detects Turing sm_75 GPU at startup
-2. Allocates **~370 chunks of 64 MB each** (init mode, guaranteed L2 eviction)
+2. Allocates **~760 chunks of 32 MB each** (init mode, >5× TU102 L2 cache for reliable detection)
 3. Tests each chunk with fill→sync→check kernels
-4. Finds the bad chunk and keeps it + 1 neighbor (**128 MB total** reserved)
+4. Finds the bad chunk and keeps it + 1 neighbor (**96 MB total** reserved — down from original 192 MB)
 5. Frees all clean chunks — CUDA allocator never touches the bad region
 
 Also includes a **rescan mode** (`ggml_cuda_guard_rescan()`) that uses 8 MB chunks
 for recovery when VRAM is partially occupied — reserves 24 MB total in that path.
+
+**Canary thread:** Every 30 seconds, `ggml_cuda_guard_verify()` checks if WDDM silently evicted
+the guard. If compromised, `ggml_cuda_guard_rescan()` automatically re-scans and re-guards.
+All guard activity is logged to `C:\Users\<user>\vram-guard\vram-guard.log` (bypasses
+LM Studio's log filtering).
 
 **Result:** Lexi 8B Q5_K_M works perfectly. Clean output on every inference.
 
